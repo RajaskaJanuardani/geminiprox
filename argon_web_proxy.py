@@ -666,20 +666,49 @@ class Handler(BaseHTTPRequestHandler):
         stream=req.get("stream", False)
         tools=req.get("tools")
         cid=f"chatcmpl-{uuid.uuid4().hex[:12]}"
-        if stream and not tools:
+        if stream:
+            # Always return SSE when stream=true (even with tools) — Hermes expects SSE
             self.send_response(200); self.send_header("Content-Type","text/event-stream"); self.send_header("Cache-Control","no-cache"); self.send_header("Access-Control-Allow-Origin","*"); self.end_headers()
             try:
-                # non-streaming fallback then chunk
                 raw=gemini_stream_generate(prompt, mode, think)
                 text=extract_response_text(raw)
-                # chunk by words for streaming feel
-                for word in text.split(" "):
-                    chunk={"id":cid,"object":"chat.completion.chunk","created":int(time.time()),"model":model_name,"choices":[{"index":0,"delta":{"content":word+" "},"finish_reason":None}]}
-                    self.wfile.write(f"data: {json.dumps(chunk, ensure_ascii=False)}\n\n".encode()); self.wfile.flush(); time.sleep(0.02)
-                final={"id":cid,"object":"chat.completion.chunk","created":int(time.time()),"model":model_name,"choices":[{"index":0,"delta":{},"finish_reason":"stop"}]}
+                # If tools, try to parse tool calls from text
+                tool_calls=None
+                if tools and text:
+                    # lightweight parse: look for tool_call blocks
+                    try:
+                        import re as _re2
+                        tcs=[]
+                        for m in _re2.finditer(r'```tool_call\s*\n(.*?)\n```', text, _re2.DOTALL):
+                            try:
+                                d=json.loads(m.group(1).strip())
+                                tcs.append({"id": f"call_{uuid.uuid4().hex[:8]}", "type":"function","function":{"name": d.get("name",""), "arguments": json.dumps(d.get("arguments",{}), ensure_ascii=False)}})
+                            except: pass
+                        if tcs:
+                            clean=re.sub(r'```tool_call\s*\n.*?\n```\s*', '', text, flags=re.DOTALL).strip()
+                            text=clean; tool_calls=tcs
+                    except: pass
+                if tool_calls:
+                    # tool_calls must be in first delta as per OpenAI spec
+                    delta={"role":"assistant","content": text or None, "tool_calls": tool_calls}
+                    chunk={"id":cid,"object":"chat.completion.chunk","created":int(time.time()),"model":model_name,"choices":[{"index":0,"delta":delta,"finish_reason":None}]}
+                    self.wfile.write(f"data: {json.dumps(chunk, ensure_ascii=False)}\n\n".encode()); self.wfile.flush()
+                else:
+                    for word in text.split(" "):
+                        if not word.strip():
+                            continue
+                        chunk={"id":cid,"object":"chat.completion.chunk","created":int(time.time()),"model":model_name,"choices":[{"index":0,"delta":{"content":word+" "},"finish_reason":None}]}
+                        self.wfile.write(f"data: {json.dumps(chunk, ensure_ascii=False)}\n\n".encode()); self.wfile.flush(); time.sleep(0.01)
+                finish="tool_calls" if tool_calls else "stop"
+                final={"id":cid,"object":"chat.completion.chunk","created":int(time.time()),"model":model_name,"choices":[{"index":0,"delta":{},"finish_reason":finish}],"usage":{"prompt_tokens":len(prompt)//4,"completion_tokens":len(text)//4,"total_tokens":(len(prompt)+len(text))//4}}
                 self.wfile.write(f"data: {json.dumps(final)}\n\n".encode()); self.wfile.write(b"data: [DONE]\n\n"); self.wfile.flush()
             except Exception as e:
                 log(f"stream err {e}")
+                # try to send error as SSE so client gets finish_reason
+                try:
+                    err_chunk={"id":cid,"object":"chat.completion.chunk","created":int(time.time()),"model":model_name,"choices":[{"index":0,"delta":{"content":f"[proxy error: {e}]"},"finish_reason":"stop"}]}
+                    self.wfile.write(f"data: {json.dumps(err_chunk)}\n\n".encode()); self.wfile.write(b"data: [DONE]\n\n"); self.wfile.flush()
+                except: pass
             return
         try:
             raw=gemini_stream_generate(prompt, mode, think)
