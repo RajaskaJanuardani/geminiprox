@@ -1,0 +1,20 @@
+# secrets
+accounts.json
+cookie.txt
+argon_config.json
+*.log
+
+# python
+__pycache__/
+*.pyc
+*.pyo
+.venv/
+venv/
+.env
+
+# os
+.DS_Store
+Thumbs.db
+
+# backup
+*.bak
